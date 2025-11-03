@@ -104,8 +104,9 @@ def main(args):
     """
     # 初始化设备和加速器
     if HAS_TPU:
-        # TPU 模式
-        device = xm.xla_device()
+        # TPU 模式 - 使用正确的 torch-xla API
+        import torch_xla
+        device = torch_xla.device()  # 替代已弃用的 xm.xla_device()
         accelerator = None
         mixed_precision_mode = 'bf16'
         print(f"✅ 使用 TPU 设备: {device}")
@@ -121,7 +122,12 @@ def main(args):
 
     # 获取设备数量（GPU或TPU）
     if HAS_TPU:
-        gpus = xm.get_world_size()  # TPU 的设备数
+        # Kaggle TPU v5e-8 有 8 个核心
+        # 可以从环境变量或直接检测
+        try:
+            gpus = xm.xla_device_count()
+        except:
+            gpus = 8  # v5e-8 默认 8 个核心
     elif accelerator.device_type == "cuda":
         gpus = torch.cuda.device_count()
     else:
@@ -129,7 +135,8 @@ def main(args):
 
     # 判断是否为主进程（TPU 和 GPU 都需要）
     if HAS_TPU:
-        is_main_process = xm.is_master_ordinal()
+        # TPU 模式下，所有进程都是"主进程"，因为 Kaggle TPU 是单节点
+        is_main_process = True
     else:
         is_main_process = accelerator.is_local_main_process
 
@@ -292,14 +299,24 @@ def main(args):
             loss = loss_dict["loss"]  # *args.global_batch_size
 
             opt.zero_grad()
-            # loss.backward()
-            accelerator.backward(loss)
-            # if accelerator.sync_gradients:
-            accelerator.wait_for_everyone()
-            accelerator.clip_grad_norm_(model.parameters(), 1)
+            # Backward pass - 根据设备类型选择不同的方法
+            if HAS_TPU:
+                loss.backward()
+                # TPU 需要调用 mark_step() 来处理梯度同步
+                xm.mark_step()
+            else:
+                accelerator.backward(loss)
+                accelerator.wait_for_everyone()
+
+            # 梯度裁剪
+            if HAS_TPU:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
+            else:
+                accelerator.clip_grad_norm_(model.parameters(), 1)
+
             opt.step()
 
-            if accelerator.is_local_main_process:
+            if is_main_process:
                 ema.update()
             # scheduler.step()
             # Log loss values:
@@ -317,9 +334,14 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
 
                 # avg_loss = avg_loss.item()
-                # if accelerator.is_local_main_process:
-                avg_loss = accelerator.gather(avg_loss)
-                avg_loss = avg_loss.mean().item()
+                # if is_main_process:
+                if HAS_TPU:
+                    # TPU 单节点，不需要 gather
+                    avg_loss = avg_loss.item()
+                else:
+                    avg_loss = accelerator.gather(avg_loss)
+                    avg_loss = avg_loss.mean().item()
+
                 logger.info(
                     f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 # Reset monitoring variables:
@@ -354,15 +376,19 @@ def main(args):
                     val_loss_v = torch.tensor(val_loss_v / log_steps_v, device=device)
 
                     # val_loss_v = val_loss_v.item()
+                    if HAS_TPU:
+                        # TPU 单节点，不需要 gather
+                        val_loss_v = val_loss_v.item()
+                    else:
+                        val_loss_v = accelerator.gather(val_loss_v)
+                        val_loss_v = val_loss_v.mean().item()
 
-                    val_loss_v = accelerator.gather(val_loss_v)
-                    val_loss_v = val_loss_v.mean().item()
                     logger.info(
                         f"(step={train_steps:07d}) Valid Loss: {val_loss_v:.4f}")
                     Loss_val.append(val_loss_v)
                     if val_loss_v < best_loss:
                         best_loss = val_loss_v
-                        if accelerator.is_local_main_process:
+                        if is_main_process:
                             checkpoint = {
                                 "model": ema.ema_model.state_dict(),
                                 # "model":  model.state_dict(),
@@ -374,31 +400,38 @@ def main(args):
                             logger.info(f"Saved checkpoint to {checkpoint_path}")
                 model.train()
 
-    if accelerator.is_local_main_process:
+    if is_main_process:
         sio.savemat(checkpoint_dir + '/loss1.mat',
                     {'loss_stage1Tr': np.stack(Loss_tr),
                      'loss_stage1Val': np.stack(Loss_val)})
 
 
 def test(args):
-    # 根据设备类型调整混合精度设置
-    # TPU 专为 BF16 优化，比 FP32 快 2-3 倍，内存节省 50%
-    # GPU 使用 FP16 获得性能优化
-    if os.environ.get('ACCELERATE_USE_TPU', False):
-        mixed_precision = 'bf16'
+    # 初始化设备和加速器
+    if HAS_TPU:
+        # TPU 模式 - 使用正确的 torch-xla API
+        import torch_xla
+        device = torch_xla.device()  # 替代已弃用的 xm.xla_device()
+        accelerator = None
+        mixed_precision_mode = 'bf16'
+        print(f"✅ 使用 TPU 设备: {device}")
+        gpus = 8  # Kaggle TPU v5e-8
     else:
-        mixed_precision = 'fp16'
-    accelerator = Accelerator(mixed_precision=mixed_precision)
-    device = accelerator.device
-    # 获取设备数量（GPU或TPU）
-    if accelerator.device_type == "cuda":
-        gpus = torch.cuda.device_count()
-    elif accelerator.device_type == "tpu":
-        gpus = accelerator.num_processes
-    else:
-        gpus = 1
+        # GPU 模式，使用 Accelerator
+        mixed_precision_mode = 'fp16'
+        accelerator = Accelerator(mixed_precision=mixed_precision_mode)
+        device = accelerator.device
+        print(f"✅ 使用 GPU 设备: {device}")
+        gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+
     seed = args.global_seed
     init_seed(seed)
+
+    # 判断是否为主进程（TPU 和 GPU 都需要）
+    if HAS_TPU:
+        is_main_process = True
+    else:
+        is_main_process = accelerator.is_local_main_process
 
     model_string_name = 'deit'  # args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
     experiment_dir = f"{args.results_dir}/{model_string_name}"  # Create an experiment folder
@@ -422,10 +455,10 @@ def test(args):
     model.load_state_dict(state_dict['model'])
 
     # 获取设备名称
-    if accelerator.device_type == "cuda":
-        gpuname = torch.cuda.get_device_name(0)
-    elif accelerator.device_type == "tpu":
+    if HAS_TPU:
         gpuname = "TPU"
+    elif torch.cuda.is_available():
+        gpuname = torch.cuda.get_device_name(0)
     else:
         gpuname = "CPU"
     # print(gpuname)
@@ -451,9 +484,14 @@ def test(args):
         pin_memory=True,
         drop_last=False
     )
-    model, loaderTe = accelerator.prepare(model, loaderTe)
+    # 只在 GPU 模式下使用 accelerator.prepare
+    if not HAS_TPU:
+        model, loaderTe = accelerator.prepare(model, loaderTe)
 
-    accelerator.print('sampling steps', args.samplingsteps)
+    if HAS_TPU:
+        print('sampling steps', args.samplingsteps)
+    else:
+        accelerator.print('sampling steps', args.samplingsteps)
     model.eval()
     with torch.no_grad():
         pred = []
@@ -471,12 +509,13 @@ def test(args):
             # x = torch.cat([x, batch_mask], dim=1)
             shape = x.shape
             # shape = [x.shape[0], 4, 16, 16]
-            if gpus == 1:
+            if gpus == 1 or HAS_TPU:
                 out = diffusion.ddim_sampleEIT(model, shape, args.samplingsteps, model_kwargs)
             else:
                 out = diffusion.ddim_sampleEIT(model.module, shape, args.samplingsteps, model_kwargs)
             # print(out.shape)
-            out = accelerator.gather(out)
+            if not HAS_TPU:
+                out = accelerator.gather(out)
             # out = out[:, 0:1, :, :]
             #
 
@@ -485,9 +524,14 @@ def test(args):
             # plt.subplot(122)
             # plt.imshow(out[0, 0].cpu())
             # plt.show()
-            x = accelerator.gather(x)
+            if not HAS_TPU:
+                x = accelerator.gather(x)
+
             rmse = (x - out).square().mean().sqrt()
-            accelerator.print('out', i, out.shape, 'rmse: ', rmse)
+            if HAS_TPU:
+                print('out', i, out.shape, 'rmse: ', rmse)
+            else:
+                accelerator.print('out', i, out.shape, 'rmse: ', rmse)
             # while 1: pass
             RMSE.append(rmse)
             out = out.squeeze()
@@ -500,7 +544,10 @@ def test(args):
 
         pred = torch.cat(pred, dim=0)
         gt1 = torch.cat(gt1, dim=0)
-        accelerator.print('out', pred.shape)
+        if HAS_TPU:
+            print('out', pred.shape)
+        else:
+            accelerator.print('out', pred.shape)
         RMSE = torch.stack(RMSE, dim=0)
         # accelerator.print('average RMSE', RMSE.mean())
         rmse = (gt1 - pred).square().mean().sqrt()
@@ -510,13 +557,18 @@ def test(args):
         max1, _ = torch.max(gt1, 1)
         max1, _ = torch.max(max1, 1)
         psnr = 10 * torch.log10(max1.square() / ((gt1 - pred).square().mean([1, 2]) + 1e-12))
-        accelerator.print('PSNR ', psnr.mean())
-        accelerator.print('RMSE whole ', rmse)
+        if HAS_TPU:
+            print('PSNR ', psnr.mean())
+            print('RMSE whole ', rmse)
+        else:
+            accelerator.print('PSNR ', psnr.mean())
+            accelerator.print('RMSE whole ', rmse)
+
         torch.save(psnr.mean(),checkpoint_dir + '/'+'PSNR.pt' )
         # pred1 = pred.clone()
         # pred1[ind] = pred
         # pred = pred1
-        if accelerator.is_main_process:
+        if is_main_process or HAS_TPU:
             sio.savemat(checkpoint_dir + '/' + modelname + '.mat',
                         {'pred': pred1.cpu() * dataTe.current / dataTe.voltage})
             # sio.savemat(checkpoint_dir + '/' +     'GT2023.mat',

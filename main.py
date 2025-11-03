@@ -220,6 +220,13 @@ def main(args, index=0):
     else:
         batch_size = args.global_batch_size
 
+    # TPU v5e-8 内存限制：15.75GB
+    # 如果批大小过大，注意力机制会产生巨大的中间矩阵导致 OOM
+    if HAS_TPU and batch_size > 4:
+        logger.warning(f"⚠️  警告: TPU 批大小 {batch_size} 可能导致内存溢出！")
+        logger.warning(f"    TPU v5e-8 只有 15.75GB 内存")
+        logger.warning(f"    建议使用 --global-batch-size 2 或 4")
+
     # 为分布式训练创建采样器
     if HAS_TPU and world_size > 1:
         from torch.utils.data import DistributedSampler
@@ -345,8 +352,8 @@ def main(args, index=0):
             # Backward pass - 根据设备类型选择不同的方法
             if HAS_TPU:
                 loss.backward()
-                # TPU 需要调用 mark_step() 来处理梯度同步
-                xm.mark_step()
+                # TPU 需要调用 sync() 来处理梯度同步
+                torch_xla.sync()
             else:
                 accelerator.backward(loss)
                 accelerator.wait_for_everyone()

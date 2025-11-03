@@ -635,11 +635,12 @@ if __name__ == "__main__":
 
     if args.mode == 'train':
         if HAS_TPU:
-            # TPU 分布式训练：在所有 8 个 TPU 核心上运行
-            print(f"🚀 启动 TPU 分布式训练，使用 {TPU_NUM_DEVICES} 个核心")
+            # TPU 分布式训练：自动使用所有可用的 TPU 核心
+            print(f"🚀 启动 TPU 分布式训练")
             print(f"   全局批大小: {args.global_batch_size}")
-            print(f"   每个核心的批大小: {args.global_batch_size // TPU_NUM_DEVICES}")
-            xmp.spawn(main, args=(args,), nprocs=TPU_NUM_DEVICES, start_method='fork')
+            # 使用 nprocs=None 让 torch_xla 自动检测所有可用的 TPU 核心
+            # Kaggle TPU v5e-8 会自动使用 8 个核心
+            xmp.spawn(main, args=(args,), nprocs=None, start_method='fork')
         else:
             # GPU 单进程训练
             main(args)

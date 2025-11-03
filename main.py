@@ -88,7 +88,14 @@ def main(args):
     """
     Trains a new DiT model.
     """
-    accelerator = Accelerator(mixed_precision='fp16')
+    # 根据设备类型调整混合精度设置
+    # TPU 专为 BF16 优化，比 FP32 快 2-3 倍，内存节省 50%
+    # GPU 使用 FP16 获得性能优化
+    if os.environ.get('ACCELERATE_USE_TPU', False):
+        mixed_precision = 'bf16'
+    else:
+        mixed_precision = 'fp16'
+    accelerator = Accelerator(mixed_precision=mixed_precision)
 
     seed = args.global_seed
     init_seed(seed)
@@ -340,7 +347,14 @@ def main(args):
 
 
 def test(args):
-    accelerator = Accelerator(mixed_precision='fp16')
+    # 根据设备类型调整混合精度设置
+    # TPU 专为 BF16 优化，比 FP32 快 2-3 倍，内存节省 50%
+    # GPU 使用 FP16 获得性能优化
+    if os.environ.get('ACCELERATE_USE_TPU', False):
+        mixed_precision = 'bf16'
+    else:
+        mixed_precision = 'fp16'
+    accelerator = Accelerator(mixed_precision=mixed_precision)
     device = accelerator.device
     # 获取设备数量（GPU或TPU）
     if accelerator.device_type == "cuda":

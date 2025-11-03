@@ -102,22 +102,24 @@ def get_data_path(specified_path):
 def main(args, index=0):
     """
     Trains a new DiT model.
-    支持 TPU 分布式训练（8 个 TPU 核心）和 GPU 训练
+    支持 TPU（单进程，自动使用所有 8 个核心）和 GPU 训练
 
     Args:
         args: 命令行参数
-        index: TPU 进程索引（0-7），GPU 模式下忽略
+        index: 进程索引，在单进程模式下忽略
     """
     # 初始化设备和加速器
     if HAS_TPU:
-        # TPU 分布式模式 - 每个进程使用不同的 TPU 核心
+        # TPU 模式 - 单进程，torch_xla 自动使用所有 8 个核心
         import torch_xla
         device = torch_xla.device()
-        rank = xm.get_ordinal()  # 当前进程的排名 (0-7)
-        world_size = xm.xrt_world_size()  # 总进程数 (8)
+        # 在单进程 TPU 模式下，rank = 0, world_size = 1
+        # torch_xla 在后台自动处理所有 8 个核心的并行化
+        rank = 0
+        world_size = 1
         accelerator = None
         mixed_precision_mode = 'bf16'
-        print(f"✅ TPU 进程 {rank}/{world_size} 已启动，设备: {device}")
+        print(f"✅ TPU 设备: {device}（自动使用所有可用核心）")
     else:
         # GPU 模式，使用 Accelerator
         mixed_precision_mode = 'fp16'
@@ -132,7 +134,9 @@ def main(args, index=0):
 
     # 获取设备数量
     if HAS_TPU:
-        gpus = world_size  # 8 个 TPU 核心
+        # TPU 单进程模式：虽然有 8 个核心，但从训练脚本角度看是 1 个设备
+        # torch_xla 会在内部自动将计算并行化到 8 个核心
+        gpus = 1  # 单进程 = 单设备
     elif torch.cuda.is_available():
         gpus = torch.cuda.device_count()
     else:

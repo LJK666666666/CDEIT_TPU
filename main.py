@@ -230,6 +230,8 @@ def main(args, index=0):
         logger.warning(f"    TPU v5e-8 只有 15.75GB 内存")
         logger.warning(f"    建议使用 --global-batch-size 2 或 4")
 
+    logger.info(f"📊 实际使用的批大小: {batch_size}")
+
     # 为分布式训练创建采样器
     if HAS_TPU and world_size > 1:
         from torch.utils.data import DistributedSampler
@@ -350,21 +352,14 @@ def main(args, index=0):
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y, y_st=y_st)
 
-            # TPU: 使用 autocast 自动混合精度
-            if HAS_TPU:
-                with torch.autocast(device_type='xla', dtype=torch.bfloat16):
-                    loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-                    loss = loss_dict["loss"]
-            else:
-                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-                loss = loss_dict["loss"]
+            # 直接前向传播，不使用 autocast（避免 XLA 张量生命周期问题）
+            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+            loss = loss_dict["loss"]
 
             opt.zero_grad()
             # Backward pass - 根据设备类型选择不同的方法
             if HAS_TPU:
                 loss.backward()
-                # TPU: 不需要手动调用 sync()，让 XLA 自动管理
-                # torch_xla.sync() 会在 loss.item() 时自动触发
             else:
                 accelerator.backward(loss)
                 accelerator.wait_for_everyone()
@@ -376,10 +371,6 @@ def main(args, index=0):
                 accelerator.clip_grad_norm_(model.parameters(), 1)
 
             opt.step()
-
-            # TPU: 在优化器步骤后同步一次，确保权重更新完成
-            if HAS_TPU:
-                xm.mark_step()
 
             if is_main_process:
                 ema.update()
@@ -434,14 +425,9 @@ def main(args, index=0):
                         t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
                         model_kwargs = dict(y=y, y_st=y_st)
 
-                        # TPU: 使用 autocast 自动混合精度
-                        if HAS_TPU:
-                            with torch.autocast(device_type='xla', dtype=torch.bfloat16):
-                                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-                                loss = loss_dict["loss"].mean()
-                        else:
-                            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-                            loss = loss_dict["loss"].mean()
+                        # 直接计算，不使用 autocast
+                        loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                        loss = loss_dict["loss"].mean()
 
                         val_loss_v += loss.item()
                         log_steps_v += 1
@@ -586,11 +572,8 @@ def test(args):
             shape = x.shape
             # shape = [x.shape[0], 4, 16, 16]
 
-            # TPU: 使用 autocast 进行推理
-            if HAS_TPU:
-                with torch.autocast(device_type='xla', dtype=torch.bfloat16):
-                    out = diffusion.ddim_sampleEIT(model, shape, args.samplingsteps, model_kwargs)
-            elif gpus == 1:
+            # 直接推理，不使用 autocast
+            if gpus == 1 or HAS_TPU:
                 out = diffusion.ddim_sampleEIT(model, shape, args.samplingsteps, model_kwargs)
             else:
                 out = diffusion.ddim_sampleEIT(model.module, shape, args.samplingsteps, model_kwargs)

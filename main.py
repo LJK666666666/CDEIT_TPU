@@ -31,7 +31,6 @@ from ema_pytorch import EMA
 try:
     import torch_xla
     import torch_xla.core.xla_model as xm
-    import torch_xla.distributed.xla_multiprocessing as xmp
     HAS_TPU = True
     TPU_NUM_DEVICES = 8  # Kaggle TPU v5e-8
 except ImportError:
@@ -635,12 +634,12 @@ if __name__ == "__main__":
 
     if args.mode == 'train':
         if HAS_TPU:
-            # TPU 分布式训练：自动使用所有可用的 TPU 核心
-            print(f"🚀 启动 TPU 分布式训练")
+            # TPU 训练：torch_xla 会自动使用所有可用的 TPU 核心
+            # Kaggle 环境不支持 xmp.spawn()，但单进程会自动并行使用 8 个核心
+            print(f"🚀 启动 TPU 训练（自动使用所有可用核心）")
             print(f"   全局批大小: {args.global_batch_size}")
-            # 使用 nprocs=None 让 torch_xla 自动检测所有可用的 TPU 核心
-            # Kaggle TPU v5e-8 会自动使用 8 个核心
-            xmp.spawn(main, args=(args,), nprocs=None, start_method='fork')
+            print(f"   TPU 会自动并行使用 8 个核心")
+            main(args)
         else:
             # GPU 单进程训练
             main(args)

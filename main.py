@@ -25,8 +25,21 @@ from dataset import EITdataset
 import scipy.io as sio
 import random
 import matplotlib.pyplot as plt
-from accelerate import Accelerator
 from ema_pytorch import EMA
+
+# 检测是否有 TPU 可用
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    HAS_TPU = True
+except ImportError:
+    HAS_TPU = False
+
+# 只在没有 TPU 的情况下导入 Accelerate
+if not HAS_TPU:
+    from accelerate import Accelerator
+else:
+    Accelerator = None
 
 
 # from diffusers.models import AutoencoderKL
@@ -87,28 +100,41 @@ def get_data_path(specified_path):
 def main(args):
     """
     Trains a new DiT model.
+    支持 TPU 和 GPU 两种设备
     """
-    # 根据设备类型调整混合精度设置
-    # TPU 专为 BF16 优化，比 FP32 快 2-3 倍，内存节省 50%
-    # GPU 使用 FP16 获得性能优化
-    if os.environ.get('ACCELERATE_USE_TPU', False):
-        mixed_precision = 'bf16'
+    # 初始化设备和加速器
+    if HAS_TPU:
+        # TPU 模式
+        device = xm.xla_device()
+        accelerator = None
+        mixed_precision_mode = 'bf16'
+        print(f"✅ 使用 TPU 设备: {device}")
     else:
-        mixed_precision = 'fp16'
-    accelerator = Accelerator(mixed_precision=mixed_precision)
+        # GPU 模式，使用 Accelerator
+        mixed_precision_mode = 'fp16'
+        accelerator = Accelerator(mixed_precision=mixed_precision_mode)
+        device = accelerator.device
+        print(f"✅ 使用 GPU 设备: {device}")
 
     seed = args.global_seed
     init_seed(seed)
-    device = accelerator.device
+
     # 获取设备数量（GPU或TPU）
-    if accelerator.device_type == "cuda":
+    if HAS_TPU:
+        gpus = xm.get_world_size()  # TPU 的设备数
+    elif accelerator.device_type == "cuda":
         gpus = torch.cuda.device_count()
-    elif accelerator.device_type == "tpu":
-        gpus = accelerator.num_processes
     else:
         gpus = 1
+
+    # 判断是否为主进程（TPU 和 GPU 都需要）
+    if HAS_TPU:
+        is_main_process = xm.is_master_ordinal()
+    else:
+        is_main_process = accelerator.is_local_main_process
+
     # Setup an experiment folder:
-    if accelerator.is_local_main_process:
+    if is_main_process:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         # experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = 'deit'  # args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
@@ -154,10 +180,10 @@ def main(args):
     #     opt , milestones=[10000, 20000, 30000,40000], gamma=0.5
     # )
     # 获取设备名称
-    if accelerator.device_type == "cuda":
-        gpuname = torch.cuda.get_device_name(0)
-    elif accelerator.device_type == "tpu":
+    if HAS_TPU:
         gpuname = "TPU"
+    elif torch.cuda.is_available():
+        gpuname = torch.cuda.get_device_name(0)
     else:
         gpuname = "CPU"
     modelname = 'DEIT'
@@ -195,7 +221,7 @@ def main(args):
         drop_last=True
     )
 
-    if accelerator.is_main_process:
+    if is_main_process:
         ema = EMA(model, beta=0.995, update_every=10)
         ema.to(device)
         ema.ema_model.eval()
@@ -216,18 +242,26 @@ def main(args):
         # model.load_state_dict(checkpoint['net'])
         opt.load_state_dict(checkpoint['optimizer'])
         # epochs = 0
-        accelerator.print('load weight')
+        if HAS_TPU:
+            print('load weight')
+        else:
+            accelerator.print('load weight')
 
         model.load_state_dict(checkpoint['model'])
-        if accelerator.is_main_process:
+        if is_main_process:
             ema = EMA(model, beta=0.995, update_every=10)
             ema.to(device)
             ema.ema_model.load_state_dict(checkpoint['model'])
             ema.ema_model.eval()
-        model, opt, loader, loaderVal = accelerator.prepare(model, opt, loader, loaderVal)
+
+        # 只在 GPU 模式下使用 accelerator.prepare
+        if not HAS_TPU:
+            model, opt, loader, loaderVal = accelerator.prepare(model, opt, loader, loaderVal)
     else:
         current_epoch = 0
-        model, opt, loader, loaderVal = accelerator.prepare(model, opt, loader, loaderVal)
+        # 只在 GPU 模式下使用 accelerator.prepare
+        if not HAS_TPU:
+            model, opt, loader, loaderVal = accelerator.prepare(model, opt, loader, loaderVal)
 
     # Variables for monitoring/logging purposes:
     train_steps = 0

@@ -180,6 +180,11 @@ def main(args, index=0):
 
     # while 1 :pass
     model = model.to(device)
+
+    # TPU：转换模型为 BF16 以节省内存（FP32->BF16 可节省 50% 内存）
+    if HAS_TPU:
+        model = model.to(torch.bfloat16)
+        logger.info("✅ 模型已转换为 BF16 精度（TPU 优化）")
     #####################
 
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
@@ -340,6 +345,13 @@ def main(args, index=0):
             x = x.to(device)  # image
             y = y.to(device)  # voltage
             y_st = y_st.to(device)
+
+            # TPU: 转换输入数据为 BF16
+            if HAS_TPU:
+                x = x.to(torch.bfloat16)
+                y = y.to(torch.bfloat16)
+                y_st = y_st.to(torch.bfloat16)
+
             # batch_mask = x != 0
             # x = torch.cat([x, batch_mask], dim=1)
 
@@ -352,8 +364,8 @@ def main(args, index=0):
             # Backward pass - 根据设备类型选择不同的方法
             if HAS_TPU:
                 loss.backward()
-                # TPU 需要调用 sync() 来处理梯度同步
-                torch_xla.sync()
+                # TPU: 不需要手动调用 sync()，让 XLA 自动管理
+                # torch_xla.sync() 会在 loss.item() 时自动触发
             else:
                 accelerator.backward(loss)
                 accelerator.wait_for_everyone()
@@ -365,6 +377,10 @@ def main(args, index=0):
                 accelerator.clip_grad_norm_(model.parameters(), 1)
 
             opt.step()
+
+            # TPU: 在优化器步骤后同步一次，确保权重更新完成
+            if HAS_TPU:
+                xm.mark_step()
 
             if is_main_process:
                 ema.update()
@@ -413,6 +429,13 @@ def main(args, index=0):
                         x = x.to(device)
                         y = y.to(device)
                         y_st = y_st.to(device)
+
+                        # TPU: 转换输入数据为 BF16
+                        if HAS_TPU:
+                            x = x.to(torch.bfloat16)
+                            y = y.to(torch.bfloat16)
+                            y_st = y_st.to(torch.bfloat16)
+
                         # batch_mask = x != 0
                         # x = torch.cat([x, batch_mask], dim=1)
                         t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
@@ -491,6 +514,12 @@ def test(args):
     # logger.info(f"Experiment directory created at {experiment_dir}")
 
     model = DiT().to(device)
+
+    # TPU：转换模型为 BF16 以节省内存
+    if HAS_TPU:
+        model = model.to(torch.bfloat16)
+        print("✅ 模型已转换为 BF16 精度（TPU 优化）")
+
     # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
     # model = DDP(model.to(device), device_ids=[rank])
     diffusion = create_diffusion(timestep_respacing="")
@@ -551,6 +580,13 @@ def test(args):
             x = x.to(device)
             y = y.to(device)
             y_st = y_st.to(device)
+
+            # TPU: 转换输入数据为 BF16
+            if HAS_TPU:
+                x = x.to(torch.bfloat16)
+                y = y.to(torch.bfloat16)
+                y_st = y_st.to(torch.bfloat16)
+
             # print(x.shape)
             # t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y, y_st=y_st)

@@ -31,9 +31,12 @@ from ema_pytorch import EMA
 try:
     import torch_xla
     import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.xla_multiprocessing as xmp
     HAS_TPU = True
+    TPU_NUM_DEVICES = 8  # Kaggle TPU v5e-8
 except ImportError:
     HAS_TPU = False
+    TPU_NUM_DEVICES = 1
 
 # 只在没有 TPU 的情况下导入 Accelerate
 if not HAS_TPU:
@@ -97,48 +100,47 @@ def get_data_path(specified_path):
 #                                  Training Loop                                #
 #################################################################################
 
-def main(args):
+def main(args, index=0):
     """
     Trains a new DiT model.
-    支持 TPU 和 GPU 两种设备
+    支持 TPU 分布式训练（8 个 TPU 核心）和 GPU 训练
+
+    Args:
+        args: 命令行参数
+        index: TPU 进程索引（0-7），GPU 模式下忽略
     """
     # 初始化设备和加速器
     if HAS_TPU:
-        # TPU 模式 - 使用正确的 torch-xla API
+        # TPU 分布式模式 - 每个进程使用不同的 TPU 核心
         import torch_xla
-        device = torch_xla.device()  # 替代已弃用的 xm.xla_device()
+        device = torch_xla.device()
+        rank = xm.get_ordinal()  # 当前进程的排名 (0-7)
+        world_size = xm.xrt_world_size()  # 总进程数 (8)
         accelerator = None
         mixed_precision_mode = 'bf16'
-        print(f"✅ 使用 TPU 设备: {device}")
+        print(f"✅ TPU 进程 {rank}/{world_size} 已启动，设备: {device}")
     else:
         # GPU 模式，使用 Accelerator
         mixed_precision_mode = 'fp16'
         accelerator = Accelerator(mixed_precision=mixed_precision_mode)
         device = accelerator.device
+        rank = 0
+        world_size = 1
         print(f"✅ 使用 GPU 设备: {device}")
 
     seed = args.global_seed
     init_seed(seed)
 
-    # 获取设备数量（GPU或TPU）
+    # 获取设备数量
     if HAS_TPU:
-        # Kaggle TPU v5e-8 有 8 个核心
-        # 可以从环境变量或直接检测
-        try:
-            gpus = xm.xla_device_count()
-        except:
-            gpus = 8  # v5e-8 默认 8 个核心
-    elif accelerator.device_type == "cuda":
+        gpus = world_size  # 8 个 TPU 核心
+    elif torch.cuda.is_available():
         gpus = torch.cuda.device_count()
     else:
         gpus = 1
 
-    # 判断是否为主进程（TPU 和 GPU 都需要）
-    if HAS_TPU:
-        # TPU 模式下，所有进程都是"主进程"，因为 Kaggle TPU 是单节点
-        is_main_process = True
-    else:
-        is_main_process = accelerator.is_local_main_process
+    # 判断是否为主进程
+    is_main_process = (rank == 0)
 
     # Setup an experiment folder:
     if is_main_process:
@@ -206,27 +208,65 @@ def main(args):
     dataVal = EITdataset(path, modelname, backup_data_path='./data')
 
     args.epochs = int(np.ceil(200000 / (len(dataset) / args.global_batch_size / gpus)))
-    batch_size = args.global_batch_size
 
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
+    # 分布式训练：每个进程处理总批大小的 1/world_size
+    # global_batch_size 是所有进程的总批大小
+    # 每个进程的本地批大小 = global_batch_size / world_size
+    if HAS_TPU and world_size > 1:
+        batch_size = max(1, args.global_batch_size // world_size)
+    else:
+        batch_size = args.global_batch_size
 
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
-
-    loaderVal = DataLoader(
-        dataVal,
-        batch_size=batch_size * 4,
-        shuffle=False,
-
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
+    # 为分布式训练创建采样器
+    if HAS_TPU and world_size > 1:
+        from torch.utils.data import DistributedSampler
+        sampler_train = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed
+        )
+        sampler_val = DistributedSampler(
+            dataVal,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            seed=args.global_seed
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler_train,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+        loaderVal = DataLoader(
+            dataVal,
+            batch_size=batch_size,
+            sampler=sampler_val,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+        loaderVal = DataLoader(
+            dataVal,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
 
     if is_main_process:
         ema = EMA(model, beta=0.995, update_every=10)
@@ -583,7 +623,7 @@ if __name__ == "__main__":
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=16)
+    parser.add_argument("--global-batch-size", type=int, default=64)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--mode", type=str, choices=["train", "test"], default="test")
     parser.add_argument("--data", type=str, choices=["simulated", "uef2017", "ktc2023"], default="simulated")
@@ -592,9 +632,19 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=1000)
     parser.add_argument("--samplingsteps", type=int, default=5)
     args = parser.parse_args()
-    if args.mode=='train':
-        main(args)
-    if args.mode=='test':
+
+    if args.mode == 'train':
+        if HAS_TPU:
+            # TPU 分布式训练：在所有 8 个 TPU 核心上运行
+            print(f"🚀 启动 TPU 分布式训练，使用 {TPU_NUM_DEVICES} 个核心")
+            print(f"   全局批大小: {args.global_batch_size}")
+            print(f"   每个核心的批大小: {args.global_batch_size // TPU_NUM_DEVICES}")
+            xmp.spawn(main, args=(args,), nprocs=TPU_NUM_DEVICES, start_method='fork')
+        else:
+            # GPU 单进程训练
+            main(args)
+
+    elif args.mode == 'test':
         test(args)
    
 
